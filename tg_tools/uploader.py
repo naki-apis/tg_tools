@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import subprocess
 import tempfile
 from pyrogram import Client
@@ -17,6 +18,8 @@ BATCH_SIZE = 10
 
 THUMB_MAX_BYTES = 200 * 1024
 THUMB_MAX_DIM = 320
+
+_PART_SUFFIX_RE = re.compile(r"\.(?:part\d+|\d{3,4}|00x)$", re.IGNORECASE)
 
 
 def human_size(n):
@@ -184,6 +187,36 @@ def file_kind(path):
     return "document"
 
 
+def _stem_for_sidecar(path):
+    base = os.path.basename(path)
+    root, _ = os.path.splitext(base)
+    while _PART_SUFFIX_RE.match(os.path.splitext(root)[1]):
+        root, _ = os.path.splitext(root)
+    return root
+
+
+def _find_sidecar_image(path):
+    folder = os.path.dirname(os.path.abspath(path)) or "."
+    stem = _stem_for_sidecar(path)
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        return None
+    abs_target = os.path.abspath(path)
+    for entry in entries:
+        full = os.path.join(folder, entry)
+        if not os.path.isfile(full):
+            continue
+        if os.path.abspath(full) == abs_target:
+            continue
+        e_root, e_ext = os.path.splitext(entry)
+        if e_ext.lower() not in IMAGE_EXTS:
+            continue
+        if e_root == stem:
+            return full
+    return None
+
+
 class TelegramUploader:
     def __init__(self, api_id, api_hash, session_name=None,
                  premium=False, zip_option=None, thumb_path=None):
@@ -220,21 +253,25 @@ class TelegramUploader:
         line = f"{bar(100)} {human_size(total)}/{human_size(total)} 100.0%"
         print("\r" + line, flush=True)
 
-    def _custom_thumb(self, mode=None):
+    def _resolve_thumb(self, path, mode=None, sidecar_source=None):
         if mode in ("image", "video"):
-            return None
-        if self.thumb_path and os.path.isfile(self.thumb_path):
-            return self.thumb_path
-        return None
+            return None, False
 
-    def _send_one(self, path, chat_id, mode, caption):
+        if self.thumb_path and os.path.isfile(self.thumb_path):
+            return prepare_thumb(self.thumb_path)
+
+        search_in = sidecar_source or path
+        sidecar = _find_sidecar_image(search_in)
+        if sidecar:
+            print(f"Sidecar thumb: {os.path.basename(sidecar)} -> {os.path.basename(path)}")
+            return prepare_thumb(sidecar)
+
+        return None, False
+
+    def _send_one(self, path, chat_id, mode, caption, sidecar_source=None):
         total = os.path.getsize(path)
         print(caption)
-        thumb_to_send = None
-        thumb_is_temp = False
-        raw_thumb = self._custom_thumb(mode)
-        if raw_thumb:
-            thumb_to_send, thumb_is_temp = prepare_thumb(raw_thumb)
+        thumb_to_send, thumb_is_temp = self._resolve_thumb(path, mode, sidecar_source)
         try:
             if mode == "video":
                 duration = get_video_duration(path)
@@ -338,7 +375,10 @@ class TelegramUploader:
                 for part in parts:
                     part_name = os.path.basename(part)
                     try:
-                        self._send_one(part, chat_id, "document", part_name)
+                        self._send_one(
+                            part, chat_id, "document", part_name,
+                            sidecar_source=path,
+                        )
                     except Exception as e:
                         self.errors.append((part, str(e)))
                         print(f"Error sending {part}: {e}")
@@ -382,7 +422,10 @@ class TelegramUploader:
                 for part in parts:
                     part_name = os.path.basename(part)
                     try:
-                        self._send_one(part, chat_id, "document", part_name)
+                        self._send_one(
+                            part, chat_id, "document", part_name,
+                            sidecar_source=folder,
+                        )
                     except Exception as e:
                         self.errors.append((part, str(e)))
                         print(f"Error sending {part}: {e}")
