@@ -1,6 +1,7 @@
 from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo
 import asyncio
+import glob
 import os
 import re
 import shlex
@@ -350,25 +351,28 @@ async def download_group_handler(client: Client, message: Message):
         await _finalize_reaction(client, message, success)
 
 
-@app.on_message(
-    (filters.private | filters.group | filters.me)
-    & ~filters.channel
-    & filters.command("cmd", prefixes=".")
-)
-async def cmd_handler(client: Client, message: Message):
+async def _run_cmd(client, message, command_name):
     await _react(client, message, "🤔")
     success = False
     try:
         text = message.text or message.caption or ""
-        prefix = ".cmd"
+        prefix = "." + command_name
         if not text.startswith(prefix):
             return
         rest = text[len(prefix):]
         if rest and not rest[0].isspace():
             return
         command = rest.strip()
+
+        no_telegram_print = False
+        if command.startswith("-ntp"):
+            after = command[4:]
+            if not after or after[0].isspace():
+                no_telegram_print = True
+                command = after.strip()
+
         if not command:
-            print("Usage: .cmd <command>")
+            print(f"Usage: .{command_name} [-ntp] <command>")
             return
         print(f"Executing: {command}")
         result = subprocess.run(
@@ -385,7 +389,8 @@ async def cmd_handler(client: Client, message: Message):
         parts.append(f"Exit code: {result.returncode}")
         output = "\n".join(parts).rstrip()
         print(output)
-        await _send_output(client, message, output)
+        if not no_telegram_print:
+            await _send_output(client, message, output)
         success = result.returncode == 0
     except Exception as e:
         print(f"Error: {str(e)[:150]}")
@@ -395,6 +400,24 @@ async def cmd_handler(client: Client, message: Message):
             pass
     finally:
         await _finalize_reaction(client, message, success)
+
+
+@app.on_message(
+    (filters.private | filters.group | filters.me)
+    & ~filters.channel
+    & filters.command("cmd", prefixes=".")
+)
+async def cmd_handler(client: Client, message: Message):
+    await _run_cmd(client, message, "cmd")
+
+
+@app.on_message(
+    (filters.private | filters.group | filters.me)
+    & ~filters.channel
+    & filters.command("c", prefixes=".")
+)
+async def c_handler(client: Client, message: Message):
+    await _run_cmd(client, message, "c")
 
 
 def _parse_up_args(message):
@@ -426,6 +449,20 @@ def _build_up_parser():
     return parser
 
 
+def _expand_sources(raw_sources):
+    expanded = []
+    for s in raw_sources:
+        if any(ch in s for ch in "*?["):
+            matches = glob.glob(s, recursive=True)
+            if matches:
+                expanded.extend(matches)
+            else:
+                expanded.append(s)
+        else:
+            expanded.append(s)
+    return expanded
+
+
 class _AsyncUploader:
     def __init__(self, client, premium=False, zip_option=None, thumb_path=None):
         self.client = client
@@ -449,6 +486,12 @@ class _AsyncUploader:
             return None, False
         if self.thumb_path and os.path.isfile(self.thumb_path):
             return prepare_thumb(self.thumb_path)
+        base, _ = os.path.splitext(path)
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            candidate = base + ext
+            if os.path.isfile(candidate):
+                print(f"Thumb: {os.path.basename(candidate)} -> {os.path.basename(path)}")
+                return prepare_thumb(candidate)
         search_in = sidecar_source or path
         sidecar = _find_sidecar_image(search_in)
         if sidecar:
@@ -669,6 +712,7 @@ async def _run_upload_async(client, args, thumb_path, default_chat):
         sources.extend(args.paths)
     if args.files:
         sources.extend(args.files)
+    sources = _expand_sources(sources)
     for s in sources:
         if os.path.isdir(s):
             await uploader.send_folder(s, chat_id=chat_id, mode=mode, media_batch=args.media_batch)
