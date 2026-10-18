@@ -3,12 +3,12 @@ from pyrogram.types import Message
 import asyncio
 import os
 import re
-import glob
 import shlex
-import shutil
 import subprocess
 from urllib.parse import urlparse
 from .config import ensure_credentials, SESSION_PATH, ensure_session_dir
+from .compressor import parse_zip_option
+from .uploader import TelegramUploader
 
 API_ID, API_HASH = ensure_credentials()
 ensure_session_dir()
@@ -244,79 +244,6 @@ async def _send_output(client, message, output):
         )
 
 
-def _parse_fs_args(message, command_name):
-    text = message.text or message.caption or ""
-    prefix = "." + command_name
-    if not text.startswith(prefix):
-        return None
-    rest = text[len(prefix):]
-    if rest and not rest[0].isspace():
-        return None
-    return rest.strip()
-
-
-def _split_fs_args(raw):
-    recursive = False
-    tokens = shlex.split(raw)
-    filtered = []
-    for token in tokens:
-        if token == "-r":
-            recursive = True
-        else:
-            filtered.append(token)
-    return filtered, recursive
-
-
-def _expand_glob(token):
-    if any(ch in token for ch in "*?["):
-        matches = sorted(glob.glob(token))
-        return matches
-    return [token]
-
-
-def _expand_tokens(tokens):
-    expanded = []
-    for token in tokens:
-        expanded.extend(_expand_glob(token))
-    return expanded
-
-
-def _list_path(path):
-    if os.path.isfile(path):
-        size = os.path.getsize(path)
-        return [f"{human_size(size):>10}  {os.path.basename(path)}"]
-    if not os.path.isdir(path):
-        return None
-    lines = []
-    try:
-        entries = sorted(os.listdir(path))
-    except OSError as e:
-        return [f"Error: {e}"]
-    for entry in entries:
-        full = os.path.join(path, entry)
-        try:
-            if os.path.isdir(full):
-                lines.append(f"{'<DIR>':>10}  {entry}/")
-            else:
-                size = os.path.getsize(full)
-                lines.append(f"{human_size(size):>10}  {entry}")
-        except OSError:
-            lines.append(f"{'?':>10}  {entry}")
-    if not lines:
-        lines.append("(empty)")
-    return lines
-
-
-def _ensure_parent(dst, recursive):
-    parent = os.path.dirname(dst)
-    if parent and not os.path.isdir(parent):
-        if recursive:
-            os.makedirs(parent, exist_ok=True)
-            return True
-        return False
-    return True
-
-
 @app.on_message(
     (filters.private | filters.group | filters.me)
     & ~filters.channel
@@ -416,165 +343,6 @@ async def download_group_handler(client: Client, message: Message):
 @app.on_message(
     (filters.private | filters.group | filters.me)
     & ~filters.channel
-    & filters.command("ls", prefixes=".")
-)
-async def ls_handler(client: Client, message: Message):
-    await _react(client, message, "🤔")
-    success = False
-    try:
-        raw = _parse_fs_args(message, "ls")
-        if raw is None:
-            return
-        try:
-            tokens, _ = _split_fs_args(raw)
-        except ValueError as e:
-            print(f"Error: {e}")
-            return
-        targets = _expand_tokens(tokens) if tokens else ["."]
-        if not targets:
-            print("Error: no matches")
-            return
-        output_lines = []
-        for target in targets:
-            lines = _list_path(target)
-            if lines is None:
-                output_lines.append(f"Error: path not found: {target}")
-                continue
-            output_lines.append(f"Listing: {os.path.abspath(target)}")
-            output_lines.extend(lines)
-            success = True
-        if output_lines:
-            await _send_output(client, message, "\n".join(output_lines))
-    except Exception as e:
-        print(f"Error: {str(e)[:150]}")
-    finally:
-        await _finalize_reaction(client, message, success)
-
-
-@app.on_message(
-    (filters.private | filters.group | filters.me)
-    & ~filters.channel
-    & filters.command("cp", prefixes=".")
-)
-async def cp_handler(client: Client, message: Message):
-    await _react(client, message, "🤔")
-    success = False
-    try:
-        raw = _parse_fs_args(message, "cp")
-        if not raw:
-            print("Usage: .cp [-r] SRC... DST")
-            return
-        try:
-            tokens, recursive = _split_fs_args(raw)
-        except ValueError as e:
-            print(f"Error: {e}")
-            return
-        if len(tokens) < 2:
-            print("Usage: .cp [-r] SRC... DST")
-            return
-        dst = tokens[-1]
-        src_tokens = tokens[:-1]
-        sources = _expand_tokens(src_tokens)
-        if not sources:
-            print("Error: no matches")
-            return
-        dst_is_dir = os.path.isdir(dst) or dst.endswith(os.sep) or dst.endswith("/")
-        if len(sources) > 1:
-            if not dst_is_dir:
-                if recursive:
-                    os.makedirs(dst, exist_ok=True)
-                    dst_is_dir = True
-                else:
-                    print(f"Error: destination must be a directory: {dst}")
-                    return
-        for src in sources:
-            if not os.path.exists(src):
-                print(f"Error: source not found: {src}")
-                continue
-            if dst_is_dir:
-                target = os.path.join(dst, os.path.basename(src.rstrip(os.sep)))
-            else:
-                target = dst
-            if not _ensure_parent(target, recursive):
-                print(f"Error: destination directory not found: {os.path.dirname(target)}")
-                continue
-            try:
-                if os.path.isdir(src):
-                    shutil.copytree(src, target, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(src, target)
-                print(f"Copied: {src} -> {target}")
-                success = True
-            except Exception as e:
-                print(f"Error copying {src}: {str(e)[:150]}")
-    except Exception as e:
-        print(f"Error: {str(e)[:150]}")
-    finally:
-        await _finalize_reaction(client, message, success)
-
-
-@app.on_message(
-    (filters.private | filters.group | filters.me)
-    & ~filters.channel
-    & filters.command("mv", prefixes=".")
-)
-async def mv_handler(client: Client, message: Message):
-    await _react(client, message, "🤔")
-    success = False
-    try:
-        raw = _parse_fs_args(message, "mv")
-        if not raw:
-            print("Usage: .mv [-r] SRC... DST")
-            return
-        try:
-            tokens, recursive = _split_fs_args(raw)
-        except ValueError as e:
-            print(f"Error: {e}")
-            return
-        if len(tokens) < 2:
-            print("Usage: .mv [-r] SRC... DST")
-            return
-        dst = tokens[-1]
-        src_tokens = tokens[:-1]
-        sources = _expand_tokens(src_tokens)
-        if not sources:
-            print("Error: no matches")
-            return
-        dst_is_dir = os.path.isdir(dst) or dst.endswith(os.sep) or dst.endswith("/")
-        if len(sources) > 1:
-            if not dst_is_dir:
-                if recursive:
-                    os.makedirs(dst, exist_ok=True)
-                    dst_is_dir = True
-                else:
-                    print(f"Error: destination must be a directory: {dst}")
-                    return
-        for src in sources:
-            if not os.path.exists(src):
-                print(f"Error: source not found: {src}")
-                continue
-            if dst_is_dir:
-                target = os.path.join(dst, os.path.basename(src.rstrip(os.sep)))
-            else:
-                target = dst
-            if not _ensure_parent(target, recursive):
-                print(f"Error: destination directory not found: {os.path.dirname(target)}")
-                continue
-            try:
-                shutil.move(src, target)
-                print(f"Moved: {src} -> {target}")
-                success = True
-            except Exception as e:
-                print(f"Error moving {src}: {str(e)[:150]}")
-    except Exception as e:
-        print(f"Error: {str(e)[:150]}")
-    finally:
-        await _finalize_reaction(client, message, success)
-
-
-@app.on_message(
-    (filters.private | filters.group | filters.me)
-    & ~filters.channel
     & filters.command("cmd", prefixes=".")
 )
 async def cmd_handler(client: Client, message: Message):
@@ -609,6 +377,158 @@ async def cmd_handler(client: Client, message: Message):
         print(output)
         await _send_output(client, message, output)
         success = result.returncode == 0
+    except Exception as e:
+        print(f"Error: {str(e)[:150]}")
+        try:
+            await _send_output(client, message, f"Error: {str(e)[:150]}")
+        except Exception:
+            pass
+    finally:
+        await _finalize_reaction(client, message, success)
+
+
+def _parse_up_args(message):
+    text = message.text or message.caption or ""
+    prefix = ".up"
+    if not text.startswith(prefix):
+        return None
+    rest = text[len(prefix):]
+    if rest and not rest[0].isspace():
+        return None
+    return rest.strip()
+
+
+def _build_up_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(prog=".up", add_help=False)
+    parser.add_argument("paths", nargs="*", default=None, metavar="RUTA")
+    parser.add_argument("-F", "--file", dest="files", action="append", default=None, metavar="RUTA")
+    parser.add_argument("--zip", metavar="TAMAÑO[/NIVEL]", default=None)
+    parser.add_argument("-T", "--thumb", metavar="RUTA", default=None)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--video", action="store_true")
+    mode_group.add_argument("--image", action="store_true")
+    mode_group.add_argument("--audio", action="store_true")
+    parser.add_argument("-IB", "--media-batch", dest="media_batch", action="store_true")
+    parser.add_argument("--premium", action="store_true")
+    parser.add_argument("--chat", metavar="CHAT_ID", default=None)
+    return parser
+
+
+async def _run_upload(args, thumb_path, api_id, api_hash, default_chat):
+    if args.video:
+        mode = "video"
+    elif args.image:
+        mode = "image"
+    elif args.audio:
+        mode = "audio"
+    else:
+        mode = "document"
+
+    zip_option = None
+    if args.zip is not None:
+        try:
+            zip_option = parse_zip_option(args.zip, premium=args.premium)
+        except ValueError as e:
+            return f"Error: {e}", False, []
+
+    chat_id = args.chat if args.chat is not None else default_chat
+
+    uploader = TelegramUploader(
+        api_id, api_hash,
+        premium=args.premium,
+        zip_option=zip_option,
+        thumb_path=thumb_path,
+    )
+
+    def _work():
+        uploader.start()
+        try:
+            sources = []
+            if args.paths:
+                sources.extend(args.paths)
+            if args.files:
+                sources.extend(args.files)
+            for s in sources:
+                if os.path.isdir(s):
+                    uploader.send_folder(s, chat_id=chat_id, mode=mode, media_batch=args.media_batch)
+                elif os.path.isfile(s):
+                    uploader.send_files([s], chat_id=chat_id, mode=mode, media_batch=args.media_batch)
+                else:
+                    uploader.errors.append((s, "no existe"))
+        finally:
+            uploader.stop()
+        return uploader
+
+    try:
+        await asyncio.to_thread(_work)
+    except Exception as e:
+        return f"Error: {str(e)[:150]}", False, []
+
+    if uploader.errors:
+        lines = ["Errores:"]
+        for path, msg in uploader.errors:
+            lines.append(f"  - {path}: {msg}")
+        return "\n".join(lines), False, uploader.errors
+    return "Subida completada.", True, []
+
+
+@app.on_message(
+    (filters.private | filters.group | filters.me)
+    & ~filters.channel
+    & filters.command("up", prefixes=".")
+)
+async def up_handler(client: Client, message: Message):
+    await _react(client, message, "🤔")
+    success = False
+    try:
+        raw = _parse_up_args(message)
+        if raw is None:
+            return
+        if not raw:
+            print("Usage: .up [--premium] [--chat CHAT] [--zip TAMAÑO[/NIVEL]] [-T thumb] [--video|--image|--audio] [-IB] RUTA... [-F RUTA ...]")
+            return
+        try:
+            argv = shlex.split(raw)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+
+        parser = _build_up_parser()
+        try:
+            args = parser.parse_args(argv)
+        except SystemExit:
+            return
+
+        thumb_path = None
+        if getattr(args, "thumb", None):
+            if not os.path.isfile(args.thumb):
+                await _send_output(client, message, f"Error: miniatura no existe: {args.thumb}")
+                return
+            if os.path.splitext(args.thumb)[1].lower() not in (".jpg", ".jpeg", ".png"):
+                await _send_output(client, message, f"Error: miniatura debe ser .jpg/.jpeg/.png: {args.thumb}")
+                return
+            thumb_path = args.thumb
+
+        sources = []
+        if args.paths:
+            sources.extend(args.paths)
+        if args.files:
+            sources.extend(args.files)
+        if not sources:
+            await _send_output(client, message, "Error: debes indicar al menos una ruta o -F/--file.")
+            return
+
+        api_id, api_hash = ensure_credentials()
+
+        output, ok, errors = await _run_upload(
+            args, thumb_path, api_id, api_hash,
+            default_chat=message.chat.id,
+        )
+        success = ok
+        await _send_output(client, message, output)
+
     except Exception as e:
         print(f"Error: {str(e)[:150]}")
         try:
