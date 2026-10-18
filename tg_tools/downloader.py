@@ -1,5 +1,5 @@
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo
 import asyncio
 import os
 import re
@@ -7,8 +7,17 @@ import shlex
 import subprocess
 from urllib.parse import urlparse
 from .config import ensure_credentials, SESSION_PATH, ensure_session_dir
-from .compressor import parse_zip_option
-from .uploader import TelegramUploader
+from .compressor import parse_zip_option, compress_to_volumes, cleanup_volumes
+from .uploader import (
+    get_video_duration,
+    get_audio_metadata,
+    get_random_thumb,
+    prepare_thumb,
+    file_kind,
+    sorted_files,
+    default_limit,
+    BATCH_SIZE,
+)
 
 API_ID, API_HASH = ensure_credentials()
 ensure_session_dir()
@@ -387,6 +396,8 @@ async def cmd_handler(client: Client, message: Message):
         await _finalize_reaction(client, message, success)
 
 
+# ---------- .up (usa el cliente async del bot, no abre sesión nueva) ----------
+
 def _parse_up_args(message):
     text = message.text or message.caption or ""
     prefix = ".up"
@@ -416,7 +427,214 @@ def _build_up_parser():
     return parser
 
 
-async def _run_upload(args, thumb_path, api_id, api_hash, default_chat):
+class _AsyncUploader:
+    """Sube con el cliente async ya iniciado del bot. No abre sesión."""
+
+    def __init__(self, client, premium=False, zip_option=None, thumb_path=None):
+        self.client = client
+        self.premium = premium
+        self.limit = default_limit(premium)
+        self.zip_option = zip_option
+        self.thumb_path = thumb_path
+        self.errors = []
+
+    def _progress(self, current, total):
+        pct = (current / total) * 100 if total else 0
+        line = f"{bar(pct)} {human_size(current)}/{human_size(total)} {pct:.1f}%"
+        print("\r" + line, end="", flush=True)
+
+    def _done(self, total):
+        line = f"{bar(100)} {human_size(total)}/{human_size(total)} 100.0%"
+        print("\r" + line, flush=True)
+
+    def _custom_thumb(self, mode):
+        if mode in ("image", "video"):
+            return None
+        if self.thumb_path and os.path.isfile(self.thumb_path):
+            return self.thumb_path
+        return None
+
+    async def _send_one(self, path, chat_id, mode, caption):
+        total = os.path.getsize(path)
+        print(caption)
+        thumb_to_send = None
+        thumb_is_temp = False
+        raw_thumb = self._custom_thumb(mode)
+        if raw_thumb:
+            thumb_to_send, thumb_is_temp = prepare_thumb(raw_thumb)
+        try:
+            if mode == "video":
+                duration = get_video_duration(path)
+                thumb = get_random_thumb(path)
+                try:
+                    await self.client.send_video(
+                        chat_id=chat_id,
+                        video=path,
+                        duration=duration,
+                        thumb=thumb,
+                        caption=caption,
+                        supports_streaming=True,
+                        progress=self._progress,
+                    )
+                finally:
+                    if thumb and os.path.exists(thumb):
+                        try:
+                            os.remove(thumb)
+                        except OSError:
+                            pass
+            elif mode == "image":
+                await self.client.send_photo(
+                    chat_id=chat_id,
+                    photo=path,
+                    caption=caption,
+                    progress=self._progress,
+                )
+            elif mode == "audio":
+                duration, performer, title = get_audio_metadata(path)
+                kwargs = {
+                    "chat_id": chat_id,
+                    "audio": path,
+                    "caption": caption,
+                    "duration": duration,
+                    "performer": performer,
+                    "title": title,
+                    "progress": self._progress,
+                }
+                if thumb_to_send:
+                    kwargs["thumb"] = thumb_to_send
+                await self.client.send_audio(**kwargs)
+            else:
+                kwargs = {
+                    "chat_id": chat_id,
+                    "document": path,
+                    "caption": caption,
+                    "progress": self._progress,
+                }
+                if thumb_to_send:
+                    kwargs["thumb"] = thumb_to_send
+                await self.client.send_document(**kwargs)
+        finally:
+            if thumb_is_temp and thumb_to_send and os.path.exists(thumb_to_send):
+                try:
+                    os.remove(thumb_to_send)
+                except OSError:
+                    pass
+        self._done(total)
+
+    async def _send_media_batch(self, paths, chat_id, caption=None):
+        total = sum(os.path.getsize(p) for p in paths if os.path.exists(p))
+        group_caption = caption if caption else f"Batch ({len(paths)} items)"
+        print(group_caption)
+        media = []
+        for i, p in enumerate(paths):
+            kind = file_kind(p)
+            cap = group_caption if i == 0 else None
+            if kind == "video":
+                duration = get_video_duration(p)
+                media.append(InputMediaVideo(media=p, caption=cap, duration=duration, supports_streaming=True))
+            else:
+                media.append(InputMediaPhoto(media=p, caption=cap))
+        await self.client.send_media_group(chat_id=chat_id, media=media)
+        self._done(total)
+
+    def _should_compress(self, path):
+        if self.zip_option is not None:
+            return True
+        return os.path.getsize(path) > self.limit
+
+    def _compress(self, path):
+        if self.zip_option is not None:
+            volume, level = self.zip_option
+        else:
+            volume = self.limit
+            level = 0
+        return compress_to_volumes(path, volume, level)
+
+    def _folder_needs_compress(self, folder):
+        for f in sorted_files(folder):
+            if os.path.getsize(f) > self.limit:
+                return True
+        return False
+
+    async def send_file(self, path, chat_id, mode="document"):
+        name = os.path.basename(path)
+        if self._should_compress(path):
+            try:
+                parts = await asyncio.to_thread(self._compress, path)
+            except Exception as e:
+                self.errors.append((path, str(e)))
+                print(f"Error compressing {path}: {e}")
+                return
+            try:
+                for part in parts:
+                    part_name = os.path.basename(part)
+                    try:
+                        await self._send_one(part, chat_id, "document", part_name)
+                    except Exception as e:
+                        self.errors.append((part, str(e)))
+                        print(f"Error sending {part}: {e}")
+            finally:
+                cleanup_volumes(parts)
+        else:
+            try:
+                await self._send_one(path, chat_id, mode, name)
+            except Exception as e:
+                self.errors.append((path, str(e)))
+                print(f"Error sending {path}: {e}")
+
+    async def _send_paths(self, paths, chat_id, default_mode, media_batch):
+        if media_batch:
+            batchable = [p for p in paths if file_kind(p) in ("image", "video")]
+            others = [p for p in paths if file_kind(p) not in ("image", "video")]
+            for i in range(0, len(batchable), BATCH_SIZE):
+                chunk = batchable[i:i + BATCH_SIZE]
+                try:
+                    await self._send_media_batch(chunk, chat_id)
+                except Exception as e:
+                    self.errors.append((f"batch {i // BATCH_SIZE + 1}", str(e)))
+                    print(f"Error sending batch: {e}")
+            for p in others:
+                await self.send_file(p, chat_id=chat_id, mode=default_mode)
+            return
+        for p in paths:
+            await self.send_file(p, chat_id=chat_id, mode=default_mode)
+
+    async def send_folder(self, folder, chat_id, mode="document", media_batch=False):
+        if not os.path.isdir(folder):
+            raise NotADirectoryError(folder)
+        needs = await asyncio.to_thread(self._folder_needs_compress, folder)
+        if self.zip_option is not None or needs:
+            try:
+                parts = await asyncio.to_thread(self._compress, folder)
+            except Exception as e:
+                self.errors.append((folder, str(e)))
+                print(f"Error compressing {folder}: {e}")
+                return
+            try:
+                for part in parts:
+                    part_name = os.path.basename(part)
+                    try:
+                        await self._send_one(part, chat_id, "document", part_name)
+                    except Exception as e:
+                        self.errors.append((part, str(e)))
+                        print(f"Error sending {part}: {e}")
+            finally:
+                cleanup_volumes(parts)
+            return
+        paths = sorted_files(folder)
+        await self._send_paths(paths, chat_id, mode, media_batch)
+
+    async def send_files(self, paths, chat_id, mode="document", media_batch=False):
+        valid = [p for p in paths if os.path.isfile(p)]
+        missing = [p for p in paths if not os.path.isfile(p)]
+        for m in missing:
+            self.errors.append((m, "file does not exist"))
+            print(f"Error: file does not exist: {m}")
+        if valid:
+            await self._send_paths(valid, chat_id, mode, media_batch)
+
+
+async def _run_upload_async(client, args, thumb_path, default_chat):
     if args.video:
         mode = "video"
     elif args.image:
@@ -431,47 +649,36 @@ async def _run_upload(args, thumb_path, api_id, api_hash, default_chat):
         try:
             zip_option = parse_zip_option(args.zip, premium=args.premium)
         except ValueError as e:
-            return f"Error: {e}", False, []
+            return f"Error: {e}", False
 
     chat_id = args.chat if args.chat is not None else default_chat
 
-    uploader = TelegramUploader(
-        api_id, api_hash,
+    uploader = _AsyncUploader(
+        client,
         premium=args.premium,
         zip_option=zip_option,
         thumb_path=thumb_path,
     )
 
-    def _work():
-        uploader.start()
-        try:
-            sources = []
-            if args.paths:
-                sources.extend(args.paths)
-            if args.files:
-                sources.extend(args.files)
-            for s in sources:
-                if os.path.isdir(s):
-                    uploader.send_folder(s, chat_id=chat_id, mode=mode, media_batch=args.media_batch)
-                elif os.path.isfile(s):
-                    uploader.send_files([s], chat_id=chat_id, mode=mode, media_batch=args.media_batch)
-                else:
-                    uploader.errors.append((s, "no existe"))
-        finally:
-            uploader.stop()
-        return uploader
-
-    try:
-        await asyncio.to_thread(_work)
-    except Exception as e:
-        return f"Error: {str(e)[:150]}", False, []
+    sources = []
+    if args.paths:
+        sources.extend(args.paths)
+    if args.files:
+        sources.extend(args.files)
+    for s in sources:
+        if os.path.isdir(s):
+            await uploader.send_folder(s, chat_id=chat_id, mode=mode, media_batch=args.media_batch)
+        elif os.path.isfile(s):
+            await uploader.send_files([s], chat_id=chat_id, mode=mode, media_batch=args.media_batch)
+        else:
+            uploader.errors.append((s, "no existe"))
 
     if uploader.errors:
         lines = ["Errores:"]
         for path, msg in uploader.errors:
             lines.append(f"  - {path}: {msg}")
-        return "\n".join(lines), False, uploader.errors
-    return "Subida completada.", True, []
+        return "\n".join(lines), False
+    return "Subida completada.", True
 
 
 @app.on_message(
@@ -520,10 +727,8 @@ async def up_handler(client: Client, message: Message):
             await _send_output(client, message, "Error: debes indicar al menos una ruta o -F/--file.")
             return
 
-        api_id, api_hash = ensure_credentials()
-
-        output, ok, errors = await _run_upload(
-            args, thumb_path, api_id, api_hash,
+        output, ok = await _run_upload_async(
+            client, args, thumb_path,
             default_chat=message.chat.id,
         )
         success = ok
