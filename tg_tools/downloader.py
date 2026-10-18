@@ -17,6 +17,7 @@ from .uploader import (
     sorted_files,
     default_limit,
     BATCH_SIZE,
+    _find_sidecar_image,
 )
 
 API_ID, API_HASH = ensure_credentials()
@@ -396,8 +397,6 @@ async def cmd_handler(client: Client, message: Message):
         await _finalize_reaction(client, message, success)
 
 
-# ---------- .up (usa el cliente async del bot, no abre sesión nueva) ----------
-
 def _parse_up_args(message):
     text = message.text or message.caption or ""
     prefix = ".up"
@@ -428,8 +427,6 @@ def _build_up_parser():
 
 
 class _AsyncUploader:
-    """Sube con el cliente async ya iniciado del bot. No abre sesión."""
-
     def __init__(self, client, premium=False, zip_option=None, thumb_path=None):
         self.client = client
         self.premium = premium
@@ -447,21 +444,22 @@ class _AsyncUploader:
         line = f"{bar(100)} {human_size(total)}/{human_size(total)} 100.0%"
         print("\r" + line, flush=True)
 
-    def _custom_thumb(self, mode):
+    def _resolve_thumb(self, path, mode, sidecar_source=None):
         if mode in ("image", "video"):
-            return None
+            return None, False
         if self.thumb_path and os.path.isfile(self.thumb_path):
-            return self.thumb_path
-        return None
+            return prepare_thumb(self.thumb_path)
+        search_in = sidecar_source or path
+        sidecar = _find_sidecar_image(search_in)
+        if sidecar:
+            print(f"Sidecar thumb: {os.path.basename(sidecar)} -> {os.path.basename(path)}")
+            return prepare_thumb(sidecar)
+        return None, False
 
-    async def _send_one(self, path, chat_id, mode, caption):
+    async def _send_one(self, path, chat_id, mode, caption, sidecar_source=None):
         total = os.path.getsize(path)
         print(caption)
-        thumb_to_send = None
-        thumb_is_temp = False
-        raw_thumb = self._custom_thumb(mode)
-        if raw_thumb:
-            thumb_to_send, thumb_is_temp = prepare_thumb(raw_thumb)
+        thumb_to_send, thumb_is_temp = self._resolve_thumb(path, mode, sidecar_source)
         try:
             if mode == "video":
                 duration = get_video_duration(path)
@@ -569,7 +567,10 @@ class _AsyncUploader:
                 for part in parts:
                     part_name = os.path.basename(part)
                     try:
-                        await self._send_one(part, chat_id, "document", part_name)
+                        await self._send_one(
+                            part, chat_id, "document", part_name,
+                            sidecar_source=path,
+                        )
                     except Exception as e:
                         self.errors.append((part, str(e)))
                         print(f"Error sending {part}: {e}")
@@ -614,7 +615,10 @@ class _AsyncUploader:
                 for part in parts:
                     part_name = os.path.basename(part)
                     try:
-                        await self._send_one(part, chat_id, "document", part_name)
+                        await self._send_one(
+                            part, chat_id, "document", part_name,
+                            sidecar_source=folder,
+                        )
                     except Exception as e:
                         self.errors.append((part, str(e)))
                         print(f"Error sending {part}: {e}")
