@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import subprocess
+import traceback
 from urllib.parse import urlparse
 from .config import ensure_credentials, SESSION_PATH, ensure_session_dir
 from .compressor import parse_zip_option, compress_to_volumes, cleanup_volumes
@@ -499,7 +500,8 @@ class _AsyncUploader:
             if os.path.isfile(candidate):
                 print(f"Thumb: {os.path.basename(candidate)} -> {os.path.basename(path)}")
                 return prepare_thumb(candidate)
-        search_in = sidecar_source or path        sidecar = _find_sidecar_image(search_in)
+        search_in = sidecar_source or path
+        sidecar = _find_sidecar_image(search_in)
         if sidecar:
             print(f"Sidecar thumb: {os.path.basename(sidecar)} -> {os.path.basename(path)}")
             return prepare_thumb(sidecar)
@@ -802,7 +804,11 @@ def _silence_peer_errors(loop, context):
     exc = context.get("exception")
     if isinstance(exc, ValueError) and "Peer id invalid" in str(exc):
         return
-    loop.default_exception_handler(context)
+    print("[loop error]", context.get("message"))
+    if exc:
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+    else:
+        loop.default_exception_handler(context)
 
 
 async def _main():
