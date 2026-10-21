@@ -19,6 +19,9 @@ from .uploader import (
     default_limit,
     BATCH_SIZE,
     _find_sidecar_image,
+    silence_pyrogram_network,
+    _short_name,
+    _NET_ERROR_FLAG,
 )
 
 API_ID, API_HASH = ensure_credentials()
@@ -179,22 +182,25 @@ async def download_single(client, target_msg, custom_name=None):
     file_path = os.path.join(os.getcwd(), filename)
     last_edit = {"t": 0.0}
 
+    print(_short_name(filename))
+
     async def progress(current, total):
         now = asyncio.get_event_loop().time()
         if now - last_edit["t"] < 2.0 and current < total:
             return
         last_edit["t"] = now
         pct = (current / total) * 100 if total else 0
-        line = f"Downloading {bar(pct)} {human_size(current)}/{human_size(total)} {pct:.1f}% {filename}"
-        print("\r" + line, end="", flush=True)
+        suffix = " [net retry]" if _NET_ERROR_FLAG["active"] else ""
+        line = f"{bar(pct)} {human_size(current)}/{human_size(total)} {pct:5.1f}%{suffix}"
+        print("\r" + line + " " * 4, end="", flush=True)
 
-    print(f"Downloading {filename}")
     file_path = await target_msg.download(
         file_name=file_path,
         progress=progress,
     )
     size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-    print("\r" + f"Downloading {bar(100)} {human_size(size)}/{human_size(size)} 100.0% {filename}", flush=True)
+    final = f"{bar(100)} {human_size(size)}/{human_size(size)} 100.0%"
+    print("\r" + final + " " * 4, flush=True)
     print(f"Saved: {file_path}")
 
 
@@ -474,12 +480,13 @@ class _AsyncUploader:
 
     def _progress(self, current, total):
         pct = (current / total) * 100 if total else 0
-        line = f"{bar(pct)} {human_size(current)}/{human_size(total)} {pct:.1f}%"
-        print("\r" + line, end="", flush=True)
+        suffix = " [net retry]" if _NET_ERROR_FLAG["active"] else ""
+        line = f"{bar(pct)} {human_size(current)}/{human_size(total)} {pct:5.1f}%{suffix}"
+        print("\r" + line + " " * 4, end="", flush=True)
 
     def _done(self, total):
         line = f"{bar(100)} {human_size(total)}/{human_size(total)} 100.0%"
-        print("\r" + line, flush=True)
+        print("\r" + line + " " * 4, flush=True)
 
     def _resolve_thumb(self, path, mode, sidecar_source=None):
         if mode in ("image", "video"):
@@ -492,8 +499,7 @@ class _AsyncUploader:
             if os.path.isfile(candidate):
                 print(f"Thumb: {os.path.basename(candidate)} -> {os.path.basename(path)}")
                 return prepare_thumb(candidate)
-        search_in = sidecar_source or path
-        sidecar = _find_sidecar_image(search_in)
+        search_in = sidecar_source or path        sidecar = _find_sidecar_image(search_in)
         if sidecar:
             print(f"Sidecar thumb: {os.path.basename(sidecar)} -> {os.path.basename(path)}")
             return prepare_thumb(sidecar)
@@ -501,7 +507,7 @@ class _AsyncUploader:
 
     async def _send_one(self, path, chat_id, mode, caption, sidecar_source=None):
         total = os.path.getsize(path)
-        print(caption)
+        print(_short_name(caption))
         thumb_to_send, thumb_is_temp = self._resolve_thumb(path, mode, sidecar_source)
         try:
             if mode == "video":
@@ -565,7 +571,7 @@ class _AsyncUploader:
     async def _send_media_batch(self, paths, chat_id, caption=None):
         total = sum(os.path.getsize(p) for p in paths if os.path.exists(p))
         group_caption = caption if caption else f"Batch ({len(paths)} items)"
-        print(group_caption)
+        print(_short_name(group_caption))
         media = []
         for i, p in enumerate(paths):
             kind = file_kind(p)
@@ -808,4 +814,5 @@ async def _main():
 
 
 def run_bot():
+    silence_pyrogram_network()
     app.run(_main())
