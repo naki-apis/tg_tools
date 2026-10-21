@@ -3,6 +3,7 @@ import random
 import re
 import subprocess
 import tempfile
+import logging
 from pyrogram import Client
 from pyrogram.types import InputMediaPhoto, InputMediaVideo
 from .compressor import compress_to_volumes, cleanup_volumes
@@ -20,6 +21,36 @@ THUMB_MAX_BYTES = 200 * 1024
 THUMB_MAX_DIM = 320
 
 _PART_SUFFIX_RE = re.compile(r"\.(?:part\d+|\d{3,4}|00x)$", re.IGNORECASE)
+
+
+# --- Logging de Pyrogram: silenciar ruido de red, exponer estado ---
+_NET_ERROR_FLAG = {"active": False}
+
+
+class _NetworkErrorFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        if ("Unable to connect" in msg or "Connection failed" in msg
+                or "socket.send()" in msg or "Connection timed out" in msg
+                or "Network is unreachable" in msg):
+            _NET_ERROR_FLAG["active"] = True
+            return False
+        return True
+
+
+def silence_pyrogram_network():
+    for name in ("pyrogram", "pyrogram.session", "pyrogram.connection",
+                 "pyrogram.session.session", "pyrogram.connection.connection",
+                 "pyrogram.client"):
+        lg = logging.getLogger(name)
+        lg.addFilter(_NetworkErrorFilter())
+        lg.propagate = False
+        lg.handlers = [logging.NullHandler()]
+        lg.setLevel(logging.CRITICAL)
+
+
+def _short_name(name, max_len=40):
+    return name if len(name) <= max_len else name[:max_len - 3] + "..."
 
 
 def human_size(n):
@@ -236,6 +267,7 @@ class TelegramUploader:
         self.errors = []
 
     def start(self):
+        silence_pyrogram_network()
         self.client.start()
 
     def stop(self):
@@ -246,12 +278,13 @@ class TelegramUploader:
 
     def _progress(self, current, total):
         pct = (current / total) * 100 if total else 0
-        line = f"{bar(pct)} {human_size(current)}/{human_size(total)} {pct:.1f}%"
-        print("\r" + line, end="", flush=True)
+        suffix = " [net retry]" if _NET_ERROR_FLAG["active"] else ""
+        line = f"{bar(pct)} {human_size(current)}/{human_size(total)} {pct:5.1f}%{suffix}"
+        print("\r" + line + " " * 4, end="", flush=True)
 
     def _done(self, total):
         line = f"{bar(100)} {human_size(total)}/{human_size(total)} 100.0%"
-        print("\r" + line, flush=True)
+        print("\r" + line + " " * 4, flush=True)
 
     def _resolve_thumb(self, path, mode=None, sidecar_source=None):
         if mode in ("image", "video"):
@@ -270,7 +303,7 @@ class TelegramUploader:
 
     def _send_one(self, path, chat_id, mode, caption, sidecar_source=None):
         total = os.path.getsize(path)
-        print(caption)
+        print(_short_name(caption))
         thumb_to_send, thumb_is_temp = self._resolve_thumb(path, mode, sidecar_source)
         try:
             if mode == "video":
@@ -334,7 +367,7 @@ class TelegramUploader:
     def _send_media_batch(self, paths, chat_id, caption=None):
         total = sum(os.path.getsize(p) for p in paths if os.path.exists(p))
         group_caption = caption if caption else f"Batch ({len(paths)} items)"
-        print(group_caption)
+        print(_short_name(group_caption))
         media = []
         for i, p in enumerate(paths):
             kind = file_kind(p)
