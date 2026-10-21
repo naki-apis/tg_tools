@@ -23,7 +23,7 @@ THUMB_MAX_DIM = 320
 _PART_SUFFIX_RE = re.compile(r"\.(?:part\d+|\d{3,4}|00x)$", re.IGNORECASE)
 
 
-# --- Logging de Pyrogram: silenciar ruido de red, exponer estado ---
+# --- Logging de Pyrogram: silenciar solo ruido de red de conexión ---
 _NET_ERROR_FLAG = {"active": False}
 
 
@@ -39,14 +39,15 @@ class _NetworkErrorFilter(logging.Filter):
 
 
 def silence_pyrogram_network():
-    for name in ("pyrogram", "pyrogram.session", "pyrogram.connection",
-                 "pyrogram.session.session", "pyrogram.connection.connection",
-                 "pyrogram.client"):
+    for name in ("pyrogram.session", "pyrogram.session.session",
+                 "pyrogram.connection", "pyrogram.connection.connection"):
         lg = logging.getLogger(name)
-        lg.addFilter(_NetworkErrorFilter())
+        if not any(isinstance(f, _NetworkErrorFilter) for f in lg.filters):
+            lg.addFilter(_NetworkErrorFilter())
         lg.propagate = False
-        lg.handlers = [logging.NullHandler()]
-        lg.setLevel(logging.CRITICAL)
+        if not lg.handlers:
+            lg.addHandler(logging.NullHandler())
+        lg.setLevel(logging.WARNING)
 
 
 def _short_name(name, max_len=40):
