@@ -7,8 +7,21 @@ from .uploader import TelegramUploader, PROFILE_EXTS
 
 
 def run_server():
-    from .downloader import run_bot
-    run_bot()
+    try:
+        from .downloader import run_bot
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        print()
+        print("Force Exit (Ctrl+C)")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 def main():
@@ -139,16 +152,7 @@ def main():
         return
 
     if args.command in ("server", "s"):
-        try:
-            run_server()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            print()
-            print("Force Exit (Ctrl+C)")
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(0)
+        run_server()
         return
 
     thumb_path = None
