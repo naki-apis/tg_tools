@@ -205,6 +205,84 @@ async def download_single(client, target_msg, custom_name=None):
     print(f"Saved: {file_path}")
 
 
+def _remote_media_size(msg):
+    for attr in ("document", "video", "audio", "voice", "video_note", "animation"):
+        m = getattr(msg, attr, None)
+        if m and getattr(m, "file_size", None):
+            return m.file_size
+    if getattr(msg, "photo", None):
+        sizes = [s.file_size for s in msg.photo.sizes if getattr(s, "file_size", None)]
+        return max(sizes) if sizes else None
+    if getattr(msg, "sticker", None):
+        return getattr(msg.sticker, "file_size", None)
+    return None
+
+
+async def download_resume_single(client, target_msg, custom_name=None):
+    if custom_name:
+        filename = custom_name
+    else:
+        filename = sanitize_filename(get_media_filename(target_msg))
+
+    file_path = os.path.join(os.getcwd(), filename)
+    remote_size = _remote_media_size(target_msg)
+    if not remote_size:
+        await download_single(client, target_msg, custom_name)
+        return
+
+    print(_short_name(filename))
+
+    chunk_size = 1024 * 1024
+    written = 0
+    offset = 0
+
+    if os.path.exists(file_path):
+        local_size = os.path.getsize(file_path)
+        if local_size >= remote_size:
+            print(f"Already complete: {file_path}")
+            print(f"Saved: {file_path}")
+            return
+        chunks_done = local_size // chunk_size
+        resume_chunk = max(0, chunks_done - 1)
+        truncate_to = resume_chunk * chunk_size
+        if truncate_to < local_size:
+            with open(file_path, "r+b") as f:
+                f.truncate(truncate_to)
+        offset = resume_chunk
+        written = truncate_to
+        print(
+            f"Resume: local={human_size(local_size)} remote={human_size(remote_size)} "
+            f"offset={offset} chunk(s) rewind=1 MiB"
+        )
+
+    last_edit = {"t": 0.0}
+
+    def _progress(written_now):
+        now = asyncio.get_event_loop().time()
+        if now - last_edit["t"] < 2.0 and written_now < remote_size:
+            return
+        last_edit["t"] = now
+        pct = (written_now / remote_size) * 100 if remote_size else 0
+        suffix = " [net retry]" if _NET_ERROR_FLAG["active"] else ""
+        line = f"{bar(pct)} {human_size(written_now)}/{human_size(remote_size)} {pct:5.1f}%{suffix}"
+        print("\r" + line + " " * 4, end="", flush=True)
+
+    _progress(written)
+
+    with open(file_path, "ab") as f:
+        async for chunk in client.stream_media(target_msg, offset=offset):
+            f.write(chunk)
+            written += len(chunk)
+            _progress(written)
+
+    size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+    final = f"{bar(100)} {human_size(size)}/{human_size(remote_size)} 100.0%"
+    print("\r" + final + " " * 4, flush=True)
+    if size != remote_size:
+        print(f"Warning: size mismatch (local={size} remote={remote_size}), run .dls again to resume")
+    print(f"Saved: {file_path}")
+
+
 async def resolve_chat(client, source_chat_id):
     if isinstance(source_chat_id, str) and source_chat_id.startswith("@"):
         chat = await client.get_chat(source_chat_id)
@@ -290,6 +368,42 @@ async def download_handler(client: Client, message: Message):
             return
 
         await download_single(client, target_msg, custom_name)
+        success = True
+
+    except Exception as e:
+        print(f"Error: {str(e)[:150]}")
+    finally:
+        await _finalize_reaction(client, message, success)
+
+
+@app.on_message(
+    (filters.private | filters.group | filters.me)
+    & ~filters.channel
+    & filters.command("dls", prefixes=".")
+)
+async def download_resume_handler(client: Client, message: Message):
+    await _react(client, message, "🤔")
+    success = False
+    try:
+        source_chat_id, msg_id, custom_name = await resolve_source(message, "dls")
+        if source_chat_id is None or msg_id is None:
+            return
+
+        source_chat_id = await resolve_chat(client, source_chat_id)
+
+        try:
+            target_msg = await client.get_messages(source_chat_id, msg_id)
+        except Exception as e:
+            print(f"Error: could not fetch message: {str(e)[:150]}")
+            return
+
+        if not target_msg or target_msg.empty:
+            return
+
+        if not target_msg.media:
+            return
+
+        await download_resume_single(client, target_msg, custom_name)
         success = True
 
     except Exception as e:
