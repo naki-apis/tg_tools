@@ -34,6 +34,10 @@ app = Client(
     api_hash=API_HASH,
 )
 
+PARTIAL_SUFFIXES = {
+    ".temp": True,
+}
+
 
 def human_size(n):
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -218,13 +222,55 @@ def _remote_media_size(msg):
     return None
 
 
+def _find_partial(target_path, remote_size):
+    candidates = []
+    if os.path.isfile(target_path):
+        try:
+            sz = os.path.getsize(target_path)
+            if remote_size is None or sz <= remote_size:
+                candidates.append((target_path, False, sz))
+        except OSError:
+            pass
+    for suf, is_temp in PARTIAL_SUFFIXES.items():
+        if not suf:
+            continue
+        candidate = target_path + suf
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            sz = os.path.getsize(candidate)
+        except OSError:
+            continue
+        if remote_size is not None and sz > remote_size:
+            continue
+        candidates.append((candidate, is_temp, sz))
+    if not candidates:
+        return None, False, 0
+    candidates.sort(key=lambda x: (x[1], -x[2]))
+    p, is_temp, sz = candidates[0]
+    return p, is_temp, sz
+
+
+def _final_name_for(partial_path, target_path):
+    if partial_path == target_path:
+        return target_path
+    for suf, is_temp in PARTIAL_SUFFIXES.items():
+        if not suf or not is_temp:
+            continue
+        if partial_path.endswith(suf):
+            stripped = partial_path[:-len(suf)]
+            if stripped:
+                return stripped
+    return target_path
+
+
 async def download_resume_single(client, target_msg, custom_name=None):
     if custom_name:
         filename = custom_name
     else:
         filename = sanitize_filename(get_media_filename(target_msg))
 
-    file_path = os.path.join(os.getcwd(), filename)
+    target_path = os.path.join(os.getcwd(), filename)
     remote_size = _remote_media_size(target_msg)
     if not remote_size:
         await download_single(client, target_msg, custom_name)
@@ -236,24 +282,32 @@ async def download_resume_single(client, target_msg, custom_name=None):
     written = 0
     offset = 0
 
-    if os.path.exists(file_path):
-        local_size = os.path.getsize(file_path)
-        if local_size >= remote_size:
-            print(f"Already complete: {file_path}")
-            print(f"Saved: {file_path}")
-            return
+    partial_path, is_temp, local_size = _find_partial(target_path, remote_size)
+
+    if partial_path is None:
+        partial_path = target_path
+        is_temp = False
+        local_size = 0
+        print(f"New download: {os.path.basename(partial_path)}")
+    elif partial_path == target_path and local_size == remote_size:
+        print(f"Already complete: {target_path}")
+        print(f"Saved: {target_path}")
+        return
+    else:
+        label = "temp" if is_temp else "existing"
+        print(
+            f"Found {label}: {os.path.basename(partial_path)} "
+            f"({human_size(local_size)}/{human_size(remote_size)})"
+        )
         chunks_done = local_size // chunk_size
         resume_chunk = max(0, chunks_done - 1)
         truncate_to = resume_chunk * chunk_size
         if truncate_to < local_size:
-            with open(file_path, "r+b") as f:
+            with open(partial_path, "r+b") as f:
                 f.truncate(truncate_to)
         offset = resume_chunk
         written = truncate_to
-        print(
-            f"Resume: local={human_size(local_size)} remote={human_size(remote_size)} "
-            f"offset={offset} chunk(s) rewind=1 MiB"
-        )
+        print(f"Resume: offset={offset} chunk(s) rewind=1 MiB (truncate_to={human_size(truncate_to)})")
 
     last_edit = {"t": 0.0}
 
@@ -269,18 +323,29 @@ async def download_resume_single(client, target_msg, custom_name=None):
 
     _progress(written)
 
-    with open(file_path, "ab") as f:
+    mode = "ab" if offset > 0 or local_size > 0 else "wb"
+    with open(partial_path, mode) as f:
         async for chunk in client.stream_media(target_msg, offset=offset):
             f.write(chunk)
             written += len(chunk)
             _progress(written)
 
-    size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+    size = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
     final = f"{bar(100)} {human_size(size)}/{human_size(remote_size)} 100.0%"
     print("\r" + final + " " * 4, flush=True)
-    if size != remote_size:
+
+    if size == remote_size and partial_path != target_path and is_temp:
+        final_path = _final_name_for(partial_path, target_path)
+        try:
+            os.replace(partial_path, final_path)
+            partial_path = final_path
+            print(f"Renamed: {os.path.basename(final_path)}")
+        except OSError as e:
+            print(f"Warning: could not rename {os.path.basename(partial_path)} -> {os.path.basename(final_path)}: {e}")
+    elif size != remote_size:
         print(f"Warning: size mismatch (local={size} remote={remote_size}), run .dls again to resume")
-    print(f"Saved: {file_path}")
+
+    print(f"Saved: {partial_path}")
 
 
 async def resolve_chat(client, source_chat_id):
