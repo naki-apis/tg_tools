@@ -202,13 +202,18 @@ def _move_to_dest(local_path, dest_dir):
             while os.path.exists(target):
                 target = f"{base}_{counter}{ext}"
                 counter += 1
-        os.replace(local_path, target)
+        result = subprocess.run(
+            ["mv", "--", local_path, target],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or f"mv exited {result.returncode}")
         print(f"Moved: {local_path} -> {target}")
         return target
     except Exception as e:
         print(f"Warning: could not move to {dest_dir}: {e}")
         return local_path
-
 
 async def download_single(client, target_msg, custom_name=None, dest_dir=None):
     if custom_name:
