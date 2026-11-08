@@ -125,16 +125,26 @@ def _raw_args(message, command_name):
 async def resolve_source(message, command_name):
     args = _raw_args(message, command_name)
     if args is None:
-        return None, None, None
+        return None, None, None, None
 
     source_chat_id = None
     msg_id = None
     custom_name = None
+    dest_dir = None
+
+    lines = args.split("\n", 1)
+    first = lines[0].strip()
+    if len(lines) > 1:
+        dest_line = lines[1].strip()
+        if dest_line:
+            dest_dir = dest_line
+
+    args = first
 
     if args.startswith("https://t.me/"):
         source_chat_id, msg_id = parse_telegram_url(args)
         if not source_chat_id or not msg_id:
-            return None, None, None
+            return None, None, None, None
     elif args and message.reply_to_message:
         source_chat_id = message.chat.id
         msg_id = message.reply_to_message.id
@@ -150,13 +160,13 @@ async def resolve_source(message, command_name):
                 msg_id = int(parts[0])
             except ValueError:
                 print(f"Usage: {command_name} (reply), {command_name} name.ext (reply), {command_name} https://t.me/user/123, {command_name} @user 123 or {command_name} -100123 456")
-                return None, None, None
+                return None, None, None, None
         elif len(parts) == 2:
             chat_input = parts[0]
             try:
                 msg_id = int(parts[1])
             except ValueError:
-                return None, None, None
+                return None, None, None, None
             if chat_input.startswith("@"):
                 source_chat_id = chat_input
             else:
@@ -167,18 +177,40 @@ async def resolve_source(message, command_name):
                         chat = await message._client.get_chat(chat_input)
                         source_chat_id = chat.id
                     except Exception:
-                        return None, None, None
+                        return None, None, None, None
         else:
             print(f"Usage: {command_name} (reply), {command_name} name.ext (reply), {command_name} https://t.me/user/123, {command_name} @user 123 or {command_name} -100123 456")
-            return None, None, None
+            return None, None, None, None
     else:
         print(f"Usage: {command_name} (reply), {command_name} name.ext (reply), {command_name} https://t.me/user/123, {command_name} @user 123 or {command_name} -100123 456")
-        return None, None, None
+        return None, None, None, None
 
-    return source_chat_id, msg_id, custom_name
+    return source_chat_id, msg_id, custom_name, dest_dir
 
 
-async def download_single(client, target_msg, custom_name=None):
+def _move_to_dest(local_path, dest_dir):
+    if not dest_dir:
+        return local_path
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        target = os.path.join(dest_dir, os.path.basename(local_path))
+        if os.path.abspath(target) == os.path.abspath(local_path):
+            return local_path
+        if os.path.exists(target):
+            base, ext = os.path.splitext(target)
+            counter = 1
+            while os.path.exists(target):
+                target = f"{base}_{counter}{ext}"
+                counter += 1
+        os.replace(local_path, target)
+        print(f"Moved: {local_path} -> {target}")
+        return target
+    except Exception as e:
+        print(f"Warning: could not move to {dest_dir}: {e}")
+        return local_path
+
+
+async def download_single(client, target_msg, custom_name=None, dest_dir=None):
     if custom_name:
         filename = custom_name
     else:
@@ -206,6 +238,7 @@ async def download_single(client, target_msg, custom_name=None):
     size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
     final = f"{bar(100)} {human_size(size)}/{human_size(size)} 100.0%"
     print("\r" + final + " " * 4, flush=True)
+    file_path = _move_to_dest(file_path, dest_dir)
     print(f"Saved: {file_path}")
 
 
@@ -264,7 +297,7 @@ def _final_name_for(partial_path, target_path):
     return target_path
 
 
-async def download_resume_single(client, target_msg, custom_name=None):
+async def download_resume_single(client, target_msg, custom_name=None, dest_dir=None):
     if custom_name:
         filename = custom_name
     else:
@@ -273,7 +306,7 @@ async def download_resume_single(client, target_msg, custom_name=None):
     target_path = os.path.join(os.getcwd(), filename)
     remote_size = _remote_media_size(target_msg)
     if not remote_size:
-        await download_single(client, target_msg, custom_name)
+        await download_single(client, target_msg, custom_name, dest_dir)
         return
 
     print(_short_name(filename))
@@ -291,7 +324,8 @@ async def download_resume_single(client, target_msg, custom_name=None):
         print(f"New download: {os.path.basename(partial_path)}")
     elif partial_path == target_path and local_size == remote_size:
         print(f"Already complete: {target_path}")
-        print(f"Saved: {target_path}")
+        final_path = _move_to_dest(target_path, dest_dir)
+        print(f"Saved: {final_path}")
         return
     else:
         label = "temp" if is_temp else "existing"
@@ -343,8 +377,9 @@ async def download_resume_single(client, target_msg, custom_name=None):
         except OSError as e:
             print(f"Warning: could not rename {os.path.basename(partial_path)} -> {os.path.basename(final_path)}: {e}")
     elif size != remote_size:
-        print(f"Warning: size mismatch (local={size} remote={remote_size}), run .dls again to resume")
+        print(f"Warning: size mismatch (local={size} remote={remote_size}), run .dl again to resume")
 
+    partial_path = _move_to_dest(partial_path, dest_dir)
     print(f"Saved: {partial_path}")
 
 
@@ -414,7 +449,7 @@ async def download_handler(client: Client, message: Message):
     await _react(client, message, "🤔")
     success = False
     try:
-        source_chat_id, msg_id, custom_name = await resolve_source(message, "dl")
+        source_chat_id, msg_id, custom_name, dest_dir = await resolve_source(message, "dl")
         if source_chat_id is None or msg_id is None:
             return
 
@@ -432,43 +467,7 @@ async def download_handler(client: Client, message: Message):
         if not target_msg.media:
             return
 
-        await download_single(client, target_msg, custom_name)
-        success = True
-
-    except Exception as e:
-        print(f"Error: {str(e)[:150]}")
-    finally:
-        await _finalize_reaction(client, message, success)
-
-
-@app.on_message(
-    (filters.private | filters.group | filters.me)
-    & ~filters.channel
-    & filters.command("dls", prefixes=".")
-)
-async def download_resume_handler(client: Client, message: Message):
-    await _react(client, message, "🤔")
-    success = False
-    try:
-        source_chat_id, msg_id, custom_name = await resolve_source(message, "dls")
-        if source_chat_id is None or msg_id is None:
-            return
-
-        source_chat_id = await resolve_chat(client, source_chat_id)
-
-        try:
-            target_msg = await client.get_messages(source_chat_id, msg_id)
-        except Exception as e:
-            print(f"Error: could not fetch message: {str(e)[:150]}")
-            return
-
-        if not target_msg or target_msg.empty:
-            return
-
-        if not target_msg.media:
-            return
-
-        await download_resume_single(client, target_msg, custom_name)
+        await download_resume_single(client, target_msg, custom_name, dest_dir)
         success = True
 
     except Exception as e:
@@ -486,7 +485,7 @@ async def download_group_handler(client: Client, message: Message):
     await _react(client, message, "🤔")
     success = False
     try:
-        source_chat_id, msg_id, custom_name = await resolve_source(message, "dlg")
+        source_chat_id, msg_id, custom_name, dest_dir = await resolve_source(message, "dlg")
         if source_chat_id is None or msg_id is None:
             return
 
@@ -505,7 +504,7 @@ async def download_group_handler(client: Client, message: Message):
             return
 
         if not target_msg.media_group_id:
-            await download_single(client, target_msg, custom_name)
+            await download_resume_single(client, target_msg, custom_name, dest_dir)
             success = True
             return
 
@@ -525,7 +524,7 @@ async def download_group_handler(client: Client, message: Message):
                 base, ext = os.path.splitext(custom_name)
                 name = f"{base}_{idx}{ext}"
             try:
-                await download_single(client, single_msg, name)
+                await download_resume_single(client, single_msg, name, dest_dir)
             except Exception as e:
                 print(f"Error downloading item {idx}: {str(e)[:150]}")
 
